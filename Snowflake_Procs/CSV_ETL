@@ -1,0 +1,123 @@
+CREATE OR REPLACE PROCEDURE AYHXD_PRD_FPA_DB.SGA.DEV_WRAP_SGA_PY()
+RETURNS VARCHAR
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.9'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS OWNER
+AS 
+$$
+"""
+***  Change Log  ***   Snowpark-Python   
+	Date	Init Description
+ ========== ==== ==============================================================
+ 2025 11 11	 jvp Initial Creation
+ 2025 11 13  jvp Update code:    remove redundancy; modularize code; set result = to return on line 62 for returning correct mssging
+                                  updated to use/call the sys purge vs sga.purge proc to reduce redundancy. 
+ 2025 11 17  jvp Update code:    update code to have file names without wildcards in dictionary since two wild
+                                  cards are used * and % in different instances i.e. sql vs regex            
+ Description: this is the wrapper (handler); filecount>blob to stg>stg to prod> catch error & log
+ Predecessor Proc: TASK_SGA
+ Following Proc : None
+ 
+***  End of Change Log  ***
+"""
+
+from datetime import datetime
+
+def main(session):
+    result = "ALLOC Uploads completed"
+
+    # Audit logging
+    timestamp = datetime.now()
+
+    # File Names / Stage Tables
+    fileStages = {
+        'ALLOCPRACT':'STG_DIM_ALLOCATION_PRACTICE',
+        'CALMTH':'STG_DIM_CALENDAR_MTH',
+        'MARKET':'STG_DIM_MARKET',
+        'PLANFULREPORTLABEL':'STG_DIM_PLANFUL_REPORT_LABEL'}
+
+    # File Names
+    fileCounts = []
+
+    # File Names for purge when missing one or more
+    filePurge = {}
+
+    # Query file counts
+    for fileName, stage in fileStages.items():
+        query = f"""
+        SELECT COUNT(*) FROM @AYHXD_PRD_FPA_DB.WFP.azure_blob_stage/Landing
+        WHERE METADATA$FILENAME ILIKE '%{fileName}%.csv'
+        """
+        count = session.sql(query).collect()[0][0]
+        fileCounts.append(count)
+
+        if count > 0:
+            filePurge[fileName] = stage
+
+    # Conditional execution
+    if all(count == 0 for count in fileCounts):
+        return "No files to process"
+        
+    elif all(count > 0 for count in fileCounts):
+        errors = []
+        statuses = {}
+        procedures = ["LD1_ALLOC_PRACT","LD1_CAL_MTH","LD1_MARKET","LD1_PLANFUL_RL"]
+
+        # Run each procedure and capture status
+        for proc in procedures:
+            try:
+                status = session.sql(f"CALL {proc}()").collect()[0][0]
+                statuses[proc] = status
+            except Exception as e:
+                errors.append(f"{proc} failed with exception: {str(e)}")
+
+        # Check if all statuses are 'LOADED'
+        if not errors and all(status == 'LOADED' for status in statuses.values()):
+            try:
+                result = session.sql("CALL LD2_ALLOC_PY()").collect()[0][0]   # Call LD2_ALLOC_PY and set result to returned result
+
+            except Exception as e:
+                result = f"ALLOC_TABLE_LOADS failed: {str(e)}"
+        else:
+            error_messages = "\n".join(errors)
+            status_messages = "\n".join([f"{proc} returned status: {status}" for proc, status in statuses.items() if status != 'LOADED'])
+            result = "Some procedures did not return ''LOADED'':\n" + error_messages + "\n" + status_messages
+        
+    else:
+        # On fail send audit log
+        endtimestamp = datetime.now()
+
+        # Delete Files from Blob
+        for file, stage in filePurge.items():
+            session.sql(f"""
+                CALL AYHXD_PRD_FPA_DB.SYS.TR2_PURGE_CSV('.*{file}*\.csv', {stage});
+            """).collect()
+
+        # Audit log
+        session.sql(f"""
+            INSERT INTO AYHXD_PRD_FPA_DB.SYS.AUDIT_LOG (
+                FILE, START_TIME, END_TIME, STATUS, ROWS_PARSED, ROWS_LOADED,
+                TABLE_NAME, ERRORS_SEEN, FIRST_ERROR, FIRST_ERROR_LINE, FIRST_ERROR_COLUMN_NAME, NOTIF_ERROR_CODE
+            )
+            VALUES (
+                'ALLOC STAGE LOAD',
+                '{timestamp}',
+                '{endtimestamp}',
+                'FAILED',
+                NULL,
+                NULL,
+                'ALLOC STAGE LOAD',
+                1,
+                'At least one ALLOC file is missing',
+                NULL,
+                NULL,
+                '501'
+            );
+        """).collect()
+
+        result = "At least one ALLOC file is missing"
+
+    return result
+$$;

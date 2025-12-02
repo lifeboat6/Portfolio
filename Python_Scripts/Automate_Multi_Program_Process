@@ -1,0 +1,269 @@
+import pandas as pd
+import numpy as np
+import shutil
+import os
+import glob
+import sqlalchemy
+import time 
+from sqlalchemy import text, create_engine
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+
+
+## THIS VERSION WILL RUN THE ONE ENTERPRISE VERSION OF SQL CODE ##
+
+## TIMER
+startTime = datetime.now()
+
+import logging
+logging.basicConfig(level=logging.INFO)
+
+######################################################################################################################################################################
+
+# Get the username from the environment variable
+username = os.getenv('USERNAME') or os.getenv('USER')
+
+## SET FILE PATH VARIABLES
+fp_year = "2025"
+fp_fcst = "5+7"
+
+##SAVE FILE NAME/LOCATION
+save_file_name_ent = f"C:/Users/{username}/Desktop/ENT_data.csv"
+save_file_name_rollup = f"C:/Users/{username}/Desktop/Output_Membership.csv"
+save_file_name_HCE = f"C:/Users/{username}/Desktop/Output_MembershipE.csv"
+
+##FINAL COPY LOCATIONS
+##move_file_name_ent = r"R:/Accounting/Budget and Forecast/FPnA Development/!!Membership/Finals_and_Support/Testing/ENT_data.csv"
+move_file_name_rollup = r"R:/Accounting/Budget and Forecast/FPnA Development/!!Membership/Finals_and_Support/Testing/Output_Membership.csv"
+move_file_name_HCE = r"R:/Accounting/Budget and Forecast/FPnA Development/!!Membership/Finals_and_Support/Testing/Output_MembershipE.csv"
+
+## SET ACTUALS YEARMONTH CUTOFF
+wm_cutoff = 202506
+
+#SQL_QUERY     
+sql_query_ent = "R:/Accounting/Budget and Forecast/FPnA Development/!!Membership/Finals_and_Support/Testing/WM_v0.3_4py.sql"
+
+## IF VALID ADJUSTMENTS SET TO TRUE ELSE LEAVE FALSE
+adjustments = False
+
+## MBR SUPPORT % VARIABLES 
+current_year = 2025
+forecast = '5+7'
+
+
+# READ DATA FROM FILE(S)
+
+#SF_XWALK
+sf = pd.read_excel(r'R:/Accounting/HCE/Enterprise Reporting/Enterprise Data Sources/Current Month/HFL service fund CW w dates.xlsx',
+                    sheet_name="HFL_CW",
+                    index_col=None,
+                    usecols = "A:E"
+                    )
+
+#PLANFUL_CW_HCE
+pcw = pd.read_excel(r'R:/Accounting/HCE/Enterprise Reporting/Enterprise Data Sources/Current Month/Planful CW - HCE.xlsx',
+                   sheet_name="Customer_code_w ADD",
+                   index_col=None)
+
+
+#ADJ
+if adjustments == True :
+    adj = pd.read_excel(r'R:/Corporate/Wellmed/Accounting/HCE/BUDGET_FORECAST/{fp_year}/{fp_fcst}/Membership/Tableau_Reports/Copy of Adjustments_working_file.xlsx',
+                   sheet_name="Output",
+                   index_col=None)
+else :
+    print("No Adjustments")
+
+
+
+######################################################################################################################################################################
+## GENERATE WM ENT MBR SUPPORT FILE/DF
+
+## REDACTED ##
+
+"""
+This section builds a support file using python and excel workbooks to scrape and format needed data
+
+"""
+
+print('Done saving Final Support Data File')
+
+# Timer2 = datetime.now() - startTime
+# print('The total run time was: ', Timer2)
+
+######################################################################################################################################################################
+## ENT SQL PIECE
+
+# SETUP CONNECTION 
+Server = 'SERVER.PMMR.COM\\SQL00'
+Database = 'tempdb'  # 'tempdb' -- for loading temp table
+Driver = 'ODBC Driver 17 for SQL Server'
+Database_Con = f'mssql+pyodbc://@{Server}/{Database}?driver={Driver}'
+
+# CREATE ENGINE TO CONNECT TO DATABASE
+engine = create_engine(Database_Con, isolation_level="AUTOCOMMIT", fast_executemany=True)
+
+Session = sessionmaker(bind=engine)
+session = Session()
+
+logging.info("starting execute create table")
+try:
+
+    with Session() as session, session.begin():
+
+        # Create a global temporary table
+        session.execute(text(f"""
+
+        drop table if exists ##planful_cw, ##sf_xwalk, ##Adj_csv, ##wm_cutoff;
+
+        CREATE TABLE ##planful_cw(
+            Plan_code_join VARCHAR(255)
+            ,Insco_Join VARCHAR(255)
+            ,Customer_code VARCHAR(255)
+            ,Product VARCHAR(255)
+            ,[Plan Type] VARCHAR(255)
+            ,Effective_Date VARCHAR(255)
+            ,Term_Date DATE
+            ,[Sequence] INT
+        );
+
+        CREATE TABLE ##sf_xwalk(
+            sf_clinic_name varchar(255)
+            ,ika_clinic_code varchar(255)
+            ,Comments varchar(255)
+            ,[Effective Date] date
+            ,[End Date] date
+        );
+
+        create table ##Adj_csv (
+            Payor varchar(255)
+            , insco varchar(255)
+            , plan_group varchar(255)
+            , Plan_Type varchar(255)
+            , plan_code varchar(255)
+            , yearmonth varchar(255)
+            , pcp_region varchar(255)
+            , pcp_market varchar(255)
+            , pcp_pool_hce varchar(255)
+            , pcp_pool varchar(255)
+            , pcp_type varchar(255)
+            , [location] varchar(255)
+            , practice varchar(255)
+            , department varchar(255)
+            , segment varchar(255)
+            , business_unit varchar(255)
+            , project_id varchar(255)
+            , customer varchar(255)
+            , product varchar(255)
+            , account varchar(255)
+            , Total_adds float
+            , Total_terms float
+            , total_net float
+            , total_membership float
+            , adj_membership float
+        );
+
+        create table ##wm_cutoff (
+            yearmonth varchar(6)
+        );
+
+        insert into ##wm_cutoff (yearmonth)
+        values
+        ('{wm_cutoff}')
+        ;
+
+    """)
+    )
+    logging.info("table(s) created")
+
+
+    ## PUSH DF(S) TO SQL
+
+    logging.info("push df to sql")
+
+    # Upload DataFrame to SQL temporary table
+    pcw.to_sql(name='##planful_cw', con=engine, index=False, if_exists='append', method='multi', chunksize=100)
+
+    sf.to_sql(name='##sf_xwalk', con=engine, index=False, if_exists='append', method='multi', chunksize=100)
+
+    if adjustments == True :
+        adj.to_sql(name='##Adj_csv', con=engine, index=False, if_exists='append', method='multi', chunksize=100)
+    else :
+        print("No adjustments")
+
+    logging.info("df to sql complete")
+
+    with open(sql_query_ent) as file: 
+        query = text(file.read())
+    logging.info("Read Query file")     
+
+    result = session.execute(query)
+    logging.info("Query Ran")
+
+    df_result_ENT = pd.DataFrame(result.fetchall())
+    logging.info("Query results to DF")
+
+    # df_result_ENT.to_csv(save_file_name_ent, index=False)   ## SAVE FILE WM
+    #logging.info("DF to csv saved")
+
+    session.commit()
+    print("Success.")
+
+except Exception as e:
+    session.rollback()
+    print(f"An error occurred: {e}")
+finally:
+    session.close()
+    engine.dispose()
+
+Timer3 = datetime.now() - startTime
+print('The total ENT run time was: ', Timer3)
+
+
+# ## COMBINE OUTPUTS                                                            For now comment out until ready
+rollup_df = df_result_ENT 
+
+HCE_df = rollup_df
+
+# IF JOINING BUDGET JOIN THAT DATA HERE SAME WITH PRIOR YEARS
+
+rollup_df['Market rollup'] = rollup_df['pcp_market']
+
+# Scenario Type
+# IF [yearmonth] <= [Parameters.Cutoff Date] THEN
+# 'Actual' ELSE 'Forecast' END
+# Formula pulled from tableau prep combine process
+
+rollup_df['Scenario Type'] = np.where(rollup_df['yearmonth'].astype(int) <= wm_cutoff, 'Actual', 'Forecast')
+
+def assign_InscoLong(insco):
+    if insco == 'CP':
+        return 'CPlus'
+    elif insco == 'FR':
+        return 'Free'
+    else:
+        return insco
+
+# Apply the function to create a new column
+rollup_df['Inscolong'] = rollup_df['insco'].apply(assign_InscoLong)
+
+## SAVE FINAL COMBINED OUTPUT
+rollup_df.to_csv(save_file_name_rollup, index=False)  ## SAVE File Combined
+
+HCE_df = HCE_df.drop(columns=['yearmonth', 'total_membership'])  ## remove columns for HCE output 
+
+HCE_df.to_csv(save_file_name_HCE, index=False)
+
+# Define the source and destination paths for both files
+files_to_move = [
+(save_file_name_rollup, move_file_name_rollup),
+(save_file_name_HCE, move_file_name_HCE)
+]
+
+# Move each file
+for src, dst in files_to_move:
+    shutil.move(src, dst)
+    print(f"Moved {src} to {dst}")
+
+Timer4 = datetime.now() - startTime
+print('The final total run time was: ', Timer4)
