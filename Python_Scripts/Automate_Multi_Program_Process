@@ -79,208 +79,12 @@ else :
 ######################################################################################################################################################################
 ## GENERATE WM ENT MBR SUPPORT FILE/DF
 
-next_year = current_year + 1
+## REDACTED ##
 
-dir_name = (r'R:/Accounting/HCE/BUDGET_FORECAST/')
+"""
+This section builds a support file using python and excel workbooks to scrape and format needed data
 
-dir_year = str(current_year) + ' Forecast/'
-
-base_filename = (r'/' + str(current_year) + ' '+ forecast + ' Membership Grids')
-
-print('Done building mem grid file path')
-
-### Building file path ###
-mypath = os.path.join(dir_name + str(current_year) +'/' + forecast + '/Membership'+ base_filename)
-
-### Create ENT Member Grid ###
-wm_file = pd.ExcelFile(mypath+ '/' + 'WM_Membership_Grid_' + str(current_year) + '_' + forecast + '_v0.6_GC' +'.xlsb')
-AUS_df = pd.read_excel(wm_file, 'AUS', header=1)
-SAT_df = pd.read_excel(wm_file, 'SAT', header=1)
-COR_df = pd.read_excel(wm_file, 'COR', header=1)
-ELP_df = pd.read_excel(wm_file, 'ELP', header=1)
-VLY_df = pd.read_excel(wm_file, 'VLY', header=1)
-HOU_df = pd.read_excel(wm_file, 'HOU', header=1)
-HKY_df = pd.read_excel(wm_file, 'HKY', header=1)
-DFW_df = pd.read_excel(wm_file, 'DFW', header=1)
-ETX_df = pd.read_excel(wm_file, 'ETX', header=1)
-WACO_df = pd.read_excel(wm_file, 'WACO', header=1)
-WTX_df = pd.read_excel(wm_file, 'WTX', header=1)
-JAX_df = pd.read_excel(wm_file, 'JAX', header=1)
-MIA_df = pd.read_excel(wm_file, 'MIA', header=1)
-ORL_df = pd.read_excel(wm_file, 'ORL', header=1)
-TAM_df = pd.read_excel(wm_file, 'TAM', header=1)
-TRC_df = pd.read_excel(wm_file, 'TRC', header=1)
-FTM_df = pd.read_excel(wm_file, 'FTM', header=1)
-NFL_df = pd.read_excel(wm_file, 'NFL', header=1)
-MIAOFL_df = pd.read_excel(wm_file, 'MIA_OFL', header=1)
-ORLOFL_df = pd.read_excel(wm_file, 'ORL_OFL', header=1)
-TAMOFL_df = pd.read_excel(wm_file, 'TAM_OFL', header=1)
-
-GNZ_df = SAT_df.replace('SAT', 'GNZ')
-DNG_df = SAT_df.replace('SAT', 'DNG')
-NEF_df = SAT_df.replace('SAT', 'NEF')
-AFF_df = DFW_df.replace('DFW', 'AFF')
-CAT_df = DFW_df.replace('DFW', 'CAT')
-DFWDNG_df = DFW_df.replace('DFW', 'DFWDNG')
-DFWEMP_df = DFW_df.replace('DFW', 'DFWEMP')
-HCAT_df = DFW_df.replace('DFW','HCAT')
-THC_df = DFW_df.replace('DFW', 'THC')
-THCASC_df = DFW_df.replace('DFW', 'THCASC')
-USMD_df = DFW_df.replace('DFW','USMD')
-
-wm_list = [
-    AUS_df
-    , SAT_df
-    , COR_df
-    , ELP_df
-    , VLY_df
-    , GNZ_df
-    , DNG_df
-    , NEF_df
-    , DFW_df
-    , AFF_df
-    , CAT_df
-    , DFWDNG_df
-    , DFWEMP_df
-    , HCAT_df
-    , THC_df
-    , THCASC_df
-    , USMD_df
-    , ETX_df
-    , WACO_df
-    , WTX_df
-    , JAX_df
-    , MIA_df
-    , ORL_df
-    , TAM_df
-    , TRC_df
-    , FTM_df
-    , NFL_df
-    , MIAOFL_df
-    , ORLOFL_df
-    , TAMOFL_df
-]
-
-ent_memgrid = pd.concat(wm_list)
-
-print('Done creating Mem Grid')
-
-### Drop excess columns ###
-
-retain_cols = ['Market','Internal/External','Insco','Plan Type','DSNP / Non-DSNP','2024\nPBP','2025\nPBP',
-               'Employed ' + str(current_year) + ' SEP Projection', 'Contracted ' + str(current_year) + ' SEP Projection', 'Affiliated ' + str(current_year) + ' SEP Projection',
-                'Employed ' + str(next_year) + ' AEP Projection', 'Contracted ' + str(next_year) + ' AEP Projection', 'Affiliated ' + str(next_year) + ' AEP Projection',
-                'Employed ' + str(next_year) + ' SEP Projection', 'Contracted ' + str(next_year) + ' SEP Projection', 'Affiliated ' + str(next_year) + ' SEP Projection']
-
-ent_df = ent_memgrid
-
-ent_df = ent_df[retain_cols]
-
-### Filter out junk data (Totals from Membership grids) ###
-
-ent_memgrid = ent_memgrid.loc[:, ~ent_memgrid.columns.str.contains('^Unnamed', na=False)]
-
-ent_memgrid = ent_memgrid.dropna(how='all')
-
-remove_str = 'Total'
-
-filter_plan_type = ent_df['Plan Type'].str.contains(remove_str, na=False)
-ent_df = ent_df[~filter_plan_type]
-
-filter_insco = ent_df['Insco'].str.contains(remove_str, na=False)
-ent_df = ent_df[~filter_insco]
-
-ent_df = ent_df.dropna(subset=['Internal/External'])
-
-print('Done saving Cleaned ENT DF')
-
-
-### Create Year column & PCP Type column ###
-
-pcp_types = ['Employed', 'Contracted', 'Affiliated']
-
-get_year = [str(current_year), str(next_year)]
-
-SEP_AEP = ['SEP Projection', 'AEP Projection']
-
-ent_df = pd.concat([ent_df]*len(pcp_types),keys = pcp_types, names = ['PCP_Type']).reset_index(level=0)
-
-ent_df = pd.concat([ent_df]*len(get_year),keys = get_year, names = ['Year']).reset_index(level=0)
-
-ent_df = pd.concat([ent_df]*len(SEP_AEP),keys = SEP_AEP, names = ['SEP' + '/' + 'AEP']).reset_index(level=0)
-
-
-### PCP Lookup to use for np.select ###
-idx = 0
-pcp_yr = ent_df['PCP_Type'] + ' ' + ent_df['Year'] + ' ' + ent_df['SEP/AEP']
-
-ent_df.insert(loc=idx, column='pcp_yr', value=pcp_yr)
-
-sep_conditions = [
-    ent_df['pcp_yr'].eq('Employed' + ' ' + str(current_year) + ' ' + ('SEP Projection')),
-    ent_df['pcp_yr'].eq('Contracted' + ' ' + str(current_year) + ' ' + ('SEP Projection')),
-    ent_df['pcp_yr'].eq('Affiliated' + ' ' + str(current_year) + ' ' + ('SEP Projection')),
-    ent_df['pcp_yr'].eq('Employed' + ' ' + str(next_year) + ' ' + ('SEP Projection')),
-    ent_df['pcp_yr'].eq('Contracted' + ' ' + str(next_year) + ' ' + ('SEP Projection')),
-    ent_df['pcp_yr'].eq('Affiliated' + ' ' + str(next_year) + ' ' + ('SEP Projection'))
-]
-
-sep_choices = [
-           ent_df['Employed ' + str(current_year) + ' SEP Projection'], 
-           ent_df['Contracted ' + str(current_year) + ' SEP Projection'],
-           ent_df['Affiliated ' + str(current_year) + ' SEP Projection'],
-           ent_df['Employed ' + str(next_year) + ' SEP Projection'], 
-           ent_df['Contracted ' + str(next_year) + ' SEP Projection'],
-           ent_df['Affiliated ' + str(next_year) + ' SEP Projection'],
-]
-
-ent_df['SEP Growth %'] = np.select(sep_conditions, sep_choices, default = 0)
-
-aep_conditions = [
-    ent_df['pcp_yr'].eq('Employed' + ' ' + str(next_year) + ' ' + ('AEP Projection')),
-    ent_df['pcp_yr'].eq('Contracted' + ' ' + str(next_year) + ' ' + ('AEP Projection')),
-    ent_df['pcp_yr'].eq('Affiliated' + ' ' + str(next_year) + ' ' + ('AEP Projection'))   
-]
-
-aep_choices = [
-           ent_df['Employed ' + str(next_year) + ' AEP Projection'], 
-           ent_df['Contracted ' + str(next_year) + ' AEP Projection'],
-           ent_df['Affiliated ' + str(next_year) + ' AEP Projection'],
-]
-
-
-ent_df['OEP Growth %'] = np.select(aep_conditions, aep_choices, default = 0)
-
-print('Done saving ENT DF Conditions')
-
-
-### Adding in Lookup_Year to use on the join to Forecast Support Files ###
-### Dropping unnecessary columns ###
-
-Lookup_Year =  ent_df['Market'] + ent_df['2025\nPBP'] + ent_df['PCP_Type'] + ent_df['Year']
-
-ent_df.insert(loc=idx, column='Lookup_Year', value=Lookup_Year)
-
-ent_df = ent_df.drop(columns=['SEP/AEP', 'pcp_yr'])
-
-ent_df = ent_df.groupby(['Lookup_Year'], as_index=False).agg({'SEP Growth %':'sum', 'OEP Growth %':'sum', 'PCP_Type':'first',
-                                                             'Market':'first', 'Internal/External':'first', 'Insco':'first',
-                                                             'Plan Type':'first', 'DSNP / Non-DSNP':'first','2024\nPBP':'first',
-                                                             '2025\nPBP': 'first'}) 
-                        
-
-ent_df['Lookup'] = ent_df['Market'] + ent_df['2025\nPBP'] + ent_df['PCP_Type']
-
-ent_df['Year'] = ent_df['Lookup_Year'].str[-4:]
-
-ent_df = ent_df[['Lookup_Year', 'Lookup','Market','2025\nPBP','PCP_Type','Year','OEP Growth %', 'SEP Growth %']].rename(columns={
-    'Market': 'pcp_market',
-    '2025\nPBP': 'plan_code',
-    'PCP_Type': 'pcp_type',
-    'Year': 'year'
-})
-
-#ent_df.to_excel(save_file_location, index=False)
+"""
 
 print('Done saving Final Support Data File')
 
@@ -288,7 +92,7 @@ print('Done saving Final Support Data File')
 # print('The total run time was: ', Timer2)
 
 ######################################################################################################################################################################
-## WM ENT SQL PIECE
+## ENT SQL PIECE
 
 # SETUP CONNECTION 
 Server = 'SERVER.PMMR.COM\\SQL00'
@@ -433,10 +237,10 @@ rollup_df['Market rollup'] = rollup_df['pcp_market']
 rollup_df['Scenario Type'] = np.where(rollup_df['yearmonth'].astype(int) <= wm_cutoff, 'Actual', 'Forecast')
 
 def assign_InscoLong(insco):
-    if insco == 'CPS':
-        return 'CarePlus'
-    elif insco == 'FRH':
-        return 'Freedom'
+    if insco == 'CP':
+        return 'CPlus'
+    elif insco == 'FR':
+        return 'Free'
     else:
         return insco
 
