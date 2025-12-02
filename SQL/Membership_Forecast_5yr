@@ -1,0 +1,1658 @@
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/*
+Server Name:	dev = TBD, test = TBD, prod = SERVER.PMMR.COM\SQL00 
+Folder Location:	FPnA Enterprise Development/Reporting
+Report Name:	Member_Forecast_5yr
+Dataset:	Main
+
+YYYY-MM-DD			Name						Notes
+-- REDACTED -- 
+
+THIS QUERY WAS CREATED TO REPLACE A VERY FRAGMENTED FORECASTING PROCESS THAT REQUIRED UPDATING 7+ SUPPORT FILES THAT REQUIRED THEIR OWN QUERIES.
+THE ORIGINAL PROCESS SPANNED EXCEL, TABLEAU, TABLEAU PREP, PYTHON, AND SQL; WITH THE FINAL SQL QUERY TAKING OVER 2 HRS TO RUN A FINAL OUTPUT (TOTAL PROCESSING 6+ HRS)
+WITH THIS UPDATED QUERY THE SUPPORT FILES ARE GENERATED INTO TEMP TABLE WITHIN THE QUERY SO THAT THEY ARE ALWAYS UPDATED ON THE RUN AND THE FORECASTING WAS TAKEN _
+OUT OF TABLEAU AND DONE IN THIS QUERY TO REDUCE LOAD TIMES ON THE TABLEAU DASHBOARDS.
+
+THIS QUERY ONLY TAKES 20 MINUTES AND PRODUCES 5 YEARS (2.8M ROWS) OF DATA WITH 50+ COLUMNS AS A FINAL OUTPUT. 
+
+
+*/
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/* 	
+RUN THIS CODE PRIOR TO RUNNING TABLEAU DATA PREP!
+
+-- DROP TABLES IF EXIST FOR LOAD
+drop table if exists ##planful_cw, ##MFS_ENT, ##Adj_csv, ##RA_Split, ##Pool_Adj_csv;
+
+-- CREATE TABLES FOR LOAD
+create table ##planful_cw(
+Plan_code_join varchar(255)
+,Insco_Join varchar(255)
+,Customer_code varchar(255)
+,Product varchar(255)
+,[Plan Type] varchar(255)
+,Effective_Date varchar(255)
+,Term_Date date
+,[Sequence] int
+);
+
+create table ##MFS_ENT(
+Lookup_Year varchar(255)
+,[Lookup] varchar(255)
+,pcp_market varchar(255)
+,plan_code varchar(255)
+,pcp_type varchar(255)
+,year int
+,[OEP Growth %] float
+,[SEP Growth %] float
+);
+
+create table ##Adj_csv (
+Payor varchar(255)
+, insco varchar(255)
+, plan_group varchar(255)
+, Plan_Type varchar(255)
+, plan_code varchar(255)
+, yearmonth varchar(255)
+, pcp_region varchar(255)
+, pcp_market varchar(255)
+, pcp_pool_hce varchar(255)
+, pcp_pool varchar(255)
+, pcp_type varchar(255)
+, [location] varchar(255)
+, practice varchar(255)
+, department varchar(255)
+, segment varchar(255)
+, business_unit varchar(255)
+, project_id varchar(255)
+, customer varchar(255)
+, product varchar(255)
+, account varchar(255)
+, Total_adds float
+, Total_terms float
+, total_net float
+, total_membership float
+, adj_membership float
+);
+
+create table ##RA_Split (
+Region_Match varchar(255)
+, YearMonth varchar(255)
+, [Plan type] varchar(255)
+, [NRA %] float
+, [RA %] float
+);
+
+--drop table if exists ##Pool_Adj_csv, #Pool_Adj;
+create table ##Pool_Adj_csv (
+Payor varchar(255)
+, insco varchar(255)
+, plan_group varchar(255)
+, Plan_Type varchar(255)
+, plan_code varchar(255)
+, yearmonth varchar(255)
+, pcp_region varchar(255)
+, pcp_market varchar(255)
+, pcp_pool_hce varchar(255)
+, pcp_pool varchar(255)
+, pcp_type varchar(255)
+, [location] varchar(255)
+, practice varchar(255)
+, department varchar(255)
+, segment varchar(255)
+, business_unit varchar(255)
+, project_id varchar(255)
+, customer varchar(255)
+, product varchar(255)
+, account varchar(255)
+, Total_adds float
+, Total_terms float
+, total_net float
+, total_membership float
+, adj_membership float
+);
+
+**** RUN TABLEAU PREP AT BEFORE MOVING ON ***
+--Check that everything is loaded
+select top 10 * from ##planful_cw
+select top 10 * from ##MFS_ENT
+select top 10 * from ##Adj_csv
+select top 10 * from ##RA_Split
+
+-- LOAD TABLES TO REGULAR TEMP
+drop table if exists #planful, #Adj, #MFS_ENT, #RA_Split, #Pool_Adj;
+
+select * into #planful from ##planful_cw;
+select count(*) from #planful;
+
+select * into #Adj from ##Adj_csv;
+select count(*) from #Adj;
+--delete from #Adj;     --- comment out if loading new adjustments
+
+select * into #MFS_ENT from ##MFS_ENT;
+select count(*) from #MFS_ENT;
+
+select * into #RA_Split from ##RA_Split;
+select count(*) from #RA_Split;
+
+select * into #Pool_Adj from ##Pool_Adj_csv;
+select count(*) from #Pool_Adj;
+
+-- DROP TABLES NO LONGER NEEDED
+drop table if exists ##planful_cw, ##MFS_ENT, ##Adj_csv, ##RA_Split;
+
+*/
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+set nocount on;
+set transaction isolation level read uncommitted;
+set ansi_warnings off;
+
+Declare @Year varchar(4)
+set @Year = YEAR(getdate())
+Declare @PriorYear varchar(4)
+set @PriorYear = YEAR(getdate())-2  --  -2 to bring in 2020312 for Tableau Workbook  
+declare @DATEPRIORYE as datetime
+set @DATEPRIORYE = Convert(date,'12/01/' + CONVERT(varchar(4), @PriorYear))
+declare @end_date as datetime
+set @end_date = Convert(date,'12/01/' + CONVERT(varchar(4), YEAR(getdate())+5))
+declare @ActualsCutoff varchar(6)
+set @ActualsCutoff = '202509'
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------		DO NOT EDIT CODE BEYOND THIS POINT		----------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+/*	SECTION 1: RUN ELIGIBILITY	*/
+
+drop table if exists #Year;
+SELECT @Year AS 'Year' INTO #Year;
+drop table if exists #PriorYear;
+SELECT @PriorYear AS PriorYear INTO #PriorYear;
+drop table if exists #DatePriorYE;
+SELECT @DATEPRIORYE AS DatePriorYE INTO #DatePriorYE;
+drop table if exists #EndDate;
+SELECT @end_date AS EndDate INTO #EndDate;
+drop table if exists #ActualsCutoff;
+SELECT @ActualsCutoff AS ActualsCutoff INTO #ActualsCutoff;
+
+/*---------------------------------- SET OEP/SEP/ADD/TERM/CONV THRESHOLD DEFAULTS -----------------------------------*/
+drop table if exists #growthThresholds;
+CREATE TABLE #growthThresholds (
+    OEP_Min DECIMAL(5,2),
+    OEP_Max DECIMAL(5,2),
+    SEP_Min DECIMAL(5,2),
+    SEP_Max DECIMAL(5,2),
+	join_key varchar(1)
+);
+
+INSERT INTO #growthThresholds (OEP_Min, OEP_Max, SEP_Min, SEP_Max, join_key)
+VALUES (0, 0, 0, 0, 1);
+
+drop table if exists #add_terms_thresholds;
+CREATE TABLE #add_terms_thresholds (
+    [Month] VARCHAR(20),
+    [Adds_Min] DECIMAL(5,2),
+	  [Adds_Max] DECIMAL(5,2),
+    [Terms_Min] DECIMAL(5,2),
+	  [Terms_Max] DECIMAL(5,2),
+	  [Conv_in_Min] DECIMAL(5,2),
+	  [Conv_in_Max] DECIMAL(5,2),
+	  [Conv_out_Min] DECIMAL(5,2),
+	  [Conv_out_Max] DECIMAL(5,2),
+);
+
+INSERT INTO #add_terms_thresholds ([Month], Adds_Min, Adds_Max, Terms_Min, Terms_Max, Conv_in_Min, Conv_in_Max, Conv_out_Min, Conv_out_Max)
+Values
+--		  [  ADDs  ] [  TERM  ] [  CVIN  ] [  CVOUT  ]
+-- TABLE REDACTED -- 
+
+
+drop table if exists #plan_conv_thresholds;
+CREATE TABLE #plan_conv_thresholds (
+    [Month] VARCHAR(20),
+	[plan_conv_out_Max] DECIMAL(5,2),
+	[plan_conv_in_Max] DECIMAL(5,2),
+);
+
+INSERT INTO #plan_conv_thresholds ([Month], plan_conv_in_Max, plan_conv_out_Max)
+Values
+-- REDACTED -- 
+;
+
+
+/*----------------------------------------  ACTUALS -------------------------------------------*/
+
+-- Create a temporary table to hold the forecast dates
+IF OBJECT_ID('tempdb..#forecast_dates') IS NOT NULL
+    DROP TABLE #forecast_dates;
+ 
+WITH 
+    cte1 (n) AS (SELECT 1 FROM (VALUES (1),(1),(1),(1),(1),(1),(1),(1),(1),(1)) n (n)),  
+    cte2 (n) AS (SELECT 1 FROM cte1 a CROSS JOIN cte1 b), 
+    cte_Calendar (dt) AS (
+        SELECT TOP (DATEDIFF(DAY, @DATEPRIORYE, @end_date) + 1)
+            CONVERT(DATE, DATEADD(DAY, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) - 1, @DATEPRIORYE))
+        FROM
+            cte2 a CROSS JOIN cte2 b                   
+        )
+    SELECT CONVERT(nvarchar(6), c.dt, 112) as [MONTH]
+	INTO #FORECAST_DATES
+    FROM cte_Calendar c
+		ORDER BY 1;
+
+/*Regular Elig Section*/
+
+-- REDACTED -- 
+
+-- Description: Joining various tables pulling together member detail data for actuals as a base for forecast
+
+Select * into #elig from Tables
+
+;
+
+/*---------------------------------------------------- APPLY ACTUALS DETAIL UPDATES --------------------------------------------------------*/
+-- various updates: region/market, proper case pcp_types, lead and lag months, etc
+Update x
+ set x.pcp_type = UPPER(LEFT(x.pcp_type, 1)) + LOWER(RIGHT(x.pcp_type, LEN(x.pcp_type) - 1)) 
+ , x.lag_month = left(convert(varchar, DATEADD(month, -1, cast(left(x.elig_month,4)+'-'+right(x.elig_month,2)+'-01'as date)), 112), 6) 
+ , x.lead_month = left(convert(varchar, DATEADD(month, 1, cast(left(x.elig_month,4)+'-'+right(x.elig_month,2)+'-01'as date)), 112), 6) 
+ , x.market = case when x.m = 'L' then x.market + '_L'
+					when x.PCP_Clinic_Code = 'UNID' then 'NG' else x.market end
+ , x.region = case when x.m = 'L' then x.region + '_L'
+					when x.PCP_Clinic_Code = 'UNID' then 'X' else x.region end
+ , x.PCP_Clinic_Code = case when x.PCP_Clinic_Code = 'UNIDUNID' then 'UNID' else x.PCP_Clinic_Code end
+ , x.IKA_Clinic_Code = case when x.IKA_Clinic_Code = 'UNIDUNID' then 'UNID' else x.IKA_Clinic_Code end
+ , x.practice = case when x.pcp_type = 'AFFILIATED' then 'AFF'
+					when x.pcp_type = 'CONTRACTED' then 'CON'
+					else x.practice end
+ , segment = case when x.m = 'L' then '00007' else segment end
+ , ess_unit = case when x.m = 'L' then '70000' else ness_unit end
+ , x.department = case when PCP_Clinic_Code = 'UNID' and region = 'G' and department is null then '60000' else x.department end
+ , x.[location] = case when PCP_Clinic_Code = 'UNID' and region = 'G' and department is null then 'US00000' else x.[location] end
+from #elig x;
+
+-- Update for plan type, payor, insco changes
+update a
+set a.plan_type = b.plan_type 
+from #elig a 
+	inner join #elig b on
+		a.elig_month = b.lag_month
+		and a.plan_id = b.plan_id
+where 
+right(a.elig_month,2) = '12'
+and
+a.plan_type <> b.plan_type;
+
+Update x
+set x.practice = a.practice
+from #elig x
+inner join #acc_codes_upd a on x.PCP_Clinic_Code = a.ika_clinic_code
+where x.practice is NULL;
+
+/*-------------------Creating scaffold for forecasting 5 years--------------------------*/
+
+if object_id ('tempdb..#lod') is not null    -- select top 5 * from #elig
+drop table #lod;
+
+select distinct payor
+	, insco
+	, plan_group
+	, plan_type
+	, plan_id as plan_code
+	, region as pcp_region
+	, market as pcp_market
+	, PCP_Clinic_Code
+	, IKA_Clinic_Code
+	, pcp_type
+	, location
+	, practice
+	, department
+	, segment
+	, business_unit
+	, project_id
+	, customer
+	, product
+into #lod
+from #elig; 
+
+if object_id ('tempdb..#scaffold') is not null
+	drop table #scaffold;
+select l.*, f.*
+into #scaffold
+from #forecast_dates f, #lod l;      
+
+/*Membership Summary*/
+
+drop table if exists #output;
+
+-- REDACTED --  5 year forecast buildout occurs here  final table == #output and includes actuals and forecast skeleton (outer year detail with no values)
+
+/*-------------------------------------- AUTO REFRESH/GENERATED SUPPORT FILES -----------------------------------------*/
+-- greater than 50 members list mkt level
+drop table if exists #mkt_over_50;
+with prior_ye as (
+	select distinct
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, sum(total_membership) as prior_ye_mbrs
+	from
+		#output
+	where
+		yearmonth = Concat(((select * from #Year) - 1), '12')
+	group by
+		pcp_region
+		, pcp_market
+		, pcp_type
+), jan_current as (
+	select distinct
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, sum(total_membership) as jan_mbrs
+	from
+		#output
+	where
+		yearmonth = Concat(((select * from #Year)), '01')
+	group by
+		pcp_region
+		, pcp_market
+		, pcp_type
+)
+select
+	a.pcp_region
+	, a.pcp_market
+	, a.pcp_type
+	, a.prior_ye_mbrs
+	, b.jan_mbrs
+into #mkt_over_50
+from
+	prior_ye a
+		left join jan_current b on
+			b.pcp_region = a.pcp_region
+			and b.pcp_market = a.pcp_market
+			and b.pcp_type = a.pcp_type
+where
+	b.jan_mbrs >= 50;
+
+-- greater than 50 members list plan level
+drop table if exists #plan_over_50;  -- 
+with prior_ye as (
+	select distinct
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+		, sum(total_membership) as prior_ye_mbrs
+	from
+		#output
+	where
+		yearmonth = Concat(((select * from #Year) - 1), '12')
+	group by
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+), jan_current as (
+	select distinct
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+		, sum(total_membership) as jan_mbrs
+	from
+		#output
+	where
+		yearmonth = Concat(((select * from #Year)), '01')
+	group by
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+)
+select
+	a.pcp_region
+	, a.pcp_market
+	, a.pcp_type
+	, a.plan_code
+	, a.prior_ye_mbrs
+	, b.jan_mbrs
+into #plan_over_50       
+from
+	prior_ye a
+		left join jan_current b on
+			b.pcp_region = a.pcp_region
+			and b.pcp_market = a.pcp_market
+			and b.pcp_type = a.pcp_type
+			and b.plan_code = a.plan_code
+where
+	b.jan_mbrs >= 50;
+
+/*----------------------------------------------- OEP SEP SECTION ---------------------------------------------*/
+
+-- SET ASSUMPTION BASE
+drop table if exists #assumptions_base;
+	select yearmonth
+		, pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_type
+		, plan_code
+		, sum(total_adds) as total_adds_conv
+		, sum(adds) as adds
+		, sum(conv_in) as conv_in
+		, sum(total_terms) as total_terms_conv
+		, sum(terms) as terms
+		, sum(conv_out) as conv_out
+		, sum(total_net) as total_net
+		, sum(total_membership) as total_membership
+		, sum(plan_adds_conv_in) as plan_adds_conv_in
+		, sum(plan_terms_conv_out) as plan_terms_conv_out
+	into #assumptions_base
+	from #output
+	where pcp_region is not null
+		and pcp_region not in ('UNID','IND')
+		and yearmonth <= (select * from #ActualsCutoff)
+	group by yearmonth
+		, pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_type
+		, plan_code;
+
+-- FILTERED ASSUMPTION BASE FOR ADDS TERMS
+drop table if exists #assumptions_base_addsterms
+select *
+into #assumptions_base_addsterms
+from #assumptions_base
+where 
+left(yearmonth,4) <> (select left(min(yearmonth),4) from #output)
+and yearmonth <= (select * from #ActualsCutoff);
+	
+-- OEP SEP SETUP FOR USE TO MAKE %
+drop table if exists #OEP_SEP;
+WITH EligibilityCTE AS (
+	SELECT
+		CAST(LEFT(yearmonth, 4) AS INT) AS elig_year,
+		pcp_region,
+		pcp_market,
+		pcp_type,
+		plan_code,
+		CASE
+			WHEN right(yearmonth,2) = '12' and left(yearmonth,4) <> left(m.max_month,4) THEN CAST(LEFT(yearmonth, 4) AS INT) + 1
+			ELSE null
+		END AS join_year_lag,
+		CAST(LEFT(yearmonth, 4) AS INT) AS join_year,
+		total_membership,
+		case when right(yearmonth,2) = '01' and left(yearmonth,4) <> left(mm.min_month,4) then 'jan'
+			--when (yearmonth = (select max(yearmonth) from #output) or right(yearmonth,2) = '12') and left(yearmonth,4) <> left(mm.min_month,4)  then 'sep_end' 
+			when (yearmonth = (select max(yearmonth) from #assumptions_base) or right(yearmonth,2) = '12') and left(yearmonth,4) <> left(mm.min_month,4)  then 'sep_end'
+			else ''
+			end as Join_type_sep,
+		case when right(yearmonth,2) = '12' and left(yearmonth,4) <> left(m.max_month,4)  then 'py_end'
+			else ''
+			end as Join_type_py
+	FROM #assumptions_base b
+	left outer join (select max(yearmonth) as max_month from #assumptions_base) m on 1=1
+	left outer join (select min(yearmonth) as min_month from #assumptions_base) mm on 1=1
+	where right(yearmonth,2) = '12' or right(yearmonth,2) = '01' or yearmonth = m.max_month
+	--and yearmonth between concat(((select * from #year) - 1), '01') and (select * from #ActualsCutoff)
+)
+SELECT
+	b.*,
+	ISNULL(pe.total_membership, 0) AS prior_year_end,   
+	ISNULL(j.total_membership, 0) AS jan_mbrs,
+	ISNULL(s.total_membership, 0) AS sep_end   
+INTO #OEP_SEP
+FROM
+	(SELECT DISTINCT
+		CAST(LEFT(yearmonth, 4) AS INT) AS elig_year,
+		pcp_region,
+		pcp_market,
+		pcp_type,
+		plan_code
+	FROM #assumptions_base
+	WHERE LEFT(yearmonth, 4) <> (SELECT LEFT(MIN(yearmonth), 4) FROM #output)
+	--WHERE left(yearmonth, 4) = (select * from #Year) and yearmonth <= (select * from #ActualsCutoff)   --- bring in only current year to match excel process
+	--WHERE left(yearmonth, 4) between (select min(yearmonth) from #assumption) and yearmonth <= (select * from #ActualsCutoff)
+	) b
+LEFT OUTER JOIN EligibilityCTE pe ON b.pcp_region = pe.pcp_region AND b.pcp_market = pe.pcp_market AND b.pcp_type = pe.pcp_type AND b.plan_code = pe.plan_code AND b.elig_year = pe.join_year_lag and pe.Join_type_py = 'py_end'
+LEFT OUTER JOIN EligibilityCTE j ON b.pcp_region = j.pcp_region AND b.pcp_market = j.pcp_market AND b.pcp_type = j.pcp_type AND b.plan_code = j.plan_code AND b.elig_year = j.join_year and j.Join_type_sep = 'jan'
+LEFT OUTER JOIN EligibilityCTE s ON b.pcp_region = s.pcp_region AND b.pcp_market = s.pcp_market AND b.pcp_type = s.pcp_type AND b.plan_code = s.plan_code AND b.elig_year = s.join_year and s.Join_type_sep = 'sep_end';
+
+-- MKT Defaults OEP/SEP %
+drop table if exists #mkt_OEP_SEP_Defaults;
+with oep_sep_grouped as (
+	select
+	pcp_region
+	, pcp_market
+	, pcp_type
+	, sum(prior_year_end) as prior_year_end
+	, sum(jan_mbrs) as jan_mbrs
+	, sum(sep_end) as sep_end
+	from
+	#OEP_SEP
+	group by
+	pcp_region
+	, pcp_market
+	, pcp_type
+)
+, oep_sep_growth as (
+	select
+	a.pcp_region
+	, a.pcp_market
+	, a.pcp_type
+	, case when a.prior_year_end = 0 and a.jan_mbrs <> 0 then 1
+		when a.prior_year_end = 0 and a.jan_mbrs = 0 then 0
+		else (cast(a.jan_mbrs as decimal) - cast(a.prior_year_end as decimal)) / nullif(cast(a.prior_year_end as decimal), 0)
+		end as OEP_Growth
+	, case when a.jan_mbrs = 0 then 0
+		else (cast(a.sep_end as decimal) - cast(a.jan_mbrs as decimal)) / nullif(cast(a.jan_mbrs as decimal), 0)
+		end as SEP_Growth
+	, 1 as join_key
+	from oep_sep_grouped a
+		inner join #mkt_over_50 b on
+			b.pcp_region = a.pcp_region
+			and b.pcp_market = a.pcp_market
+			and b.pcp_type = a.pcp_type
+)
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, case 
+	when a.OEP_Growth < 0 then 
+		case 
+			when a.OEP_Growth > b.OEP_Min then Cast(a.OEP_Growth as decimal(19,4))
+			else Cast(b.OEP_Min as decimal(19,4))
+		end
+	else
+		case 
+			when a.OEP_Growth < b.OEP_Max then cast(a.OEP_Growth as decimal(19,4))
+			else cast(b.OEP_Max as decimal(19,4))
+		end
+	end as OEP_Growth_Final
+, case 
+	when a.SEP_Growth < 0 then 
+		case 
+			when a.SEP_Growth > b.SEP_Min then cast(a.SEP_Growth as decimal(19,4))
+			else cast(b.SEP_Min as decimal(19,4))
+		end
+	else
+		case 
+			when a.SEP_Growth < b.SEP_Max then cast(a.SEP_Growth as decimal(19,4))
+			else cast(b.SEP_Max as decimal(19,4))
+		end
+	end as SEP_Growth_Final
+into #mkt_OEP_SEP_Defaults
+from
+oep_sep_growth a
+	left join #growthThresholds b on
+		b.join_key = a.join_key;
+
+-- Plan Level Defualts OEP/SEP %
+drop table if exists #plan_OEP_SEP_Defaults;
+with oep_sep_grouped as (
+	select
+	pcp_region
+	, pcp_market
+	, pcp_type
+	, plan_code
+	, sum(prior_year_end) as prior_year_end
+	, sum(jan_mbrs) as jan_mbrs
+	, sum(sep_end) as sep_end
+	from
+	#OEP_SEP
+	group by
+	pcp_region
+	, pcp_market
+	, pcp_type
+	, plan_code
+)
+, oep_sep_growth as (
+	select
+	a.pcp_region
+	, a.pcp_market
+	, a.pcp_type
+	, a.plan_code
+	, case when a.prior_year_end = 0 and a.jan_mbrs <> 0 then 1
+		when a.prior_year_end = 0 and a.jan_mbrs = 0 then 0
+		else (cast(a.jan_mbrs as decimal) - cast(a.prior_year_end as decimal)) / nullif(cast(a.prior_year_end as decimal), 0)
+		end as OEP_Growth
+	, case when a.jan_mbrs = 0 then 0
+		else (cast(a.sep_end as decimal) - cast(a.jan_mbrs as decimal)) / nullif(cast(a.jan_mbrs as decimal), 0)
+		end as SEP_Growth
+	, 1 as join_key
+	from oep_sep_grouped a
+		inner join #plan_over_50 b on
+			b.pcp_region = a.pcp_region
+			and b.pcp_market = a.pcp_market
+			and b.pcp_type = a.pcp_type
+			and b.plan_code = a.plan_code
+)
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_code
+, case 
+	when a.OEP_Growth < 0 then 
+		case 
+			when a.OEP_Growth > b.OEP_Min then Cast(a.OEP_Growth as decimal(19,4))
+			else Cast(b.OEP_Min as decimal(19,4))
+		end
+	else
+		case 
+			when a.OEP_Growth < b.OEP_Max then cast(a.OEP_Growth as decimal(19,4))
+			else cast(b.OEP_Max as decimal(19,4))
+		end
+	end as OEP_Growth_Final
+, case 
+	when a.SEP_Growth < 0 then 
+		case 
+			when a.SEP_Growth > b.SEP_Min then cast(a.SEP_Growth as decimal(19,4))
+			else cast(b.SEP_Min as decimal(19,4))
+		end
+	else
+		case 
+			when a.SEP_Growth < b.SEP_Max then cast(a.SEP_Growth as decimal(19,4))
+			else cast(b.SEP_Max as decimal(19,4))
+		end
+	end as SEP_Growth_Final
+into #plan_OEP_SEP_Defaults
+from
+oep_sep_growth a
+	left join #growthThresholds b on
+		b.join_key = a.join_key;
+
+
+/*------------------------------------- ADDS TERMS CONV DEFAULT % SECTION ------------------------------------------------------*/
+
+drop table if exists #new_plans, #market_defaults, #adds_terms_calcs;
+
+-- new plan table @ region, market, pcp_type, plan level
+with prior_ye as (
+	select distinct
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+		, sum(total_membership) as prior_ye_mbrs
+	from
+		#output
+	where
+		yearmonth = Concat(((select * from #Year) - 1), '12')
+	group by
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+), jan_current as (
+	select distinct
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+		, sum(total_membership) as jan_mbrs
+	from
+		#output
+	where
+		yearmonth = Concat(((select * from #Year)), '01')
+	group by
+		pcp_region
+		, pcp_market
+		, pcp_type
+		, plan_code
+)
+select
+	a.pcp_region
+	, a.pcp_market
+	, a.pcp_type
+	, a.plan_code
+	--a.*
+	--, b.jan_mbrs
+into #new_plans
+from
+	prior_ye a
+		left join jan_current b on
+			b.pcp_region = a.pcp_region
+			and b.pcp_market = a.pcp_market
+			and b.pcp_type = a.pcp_type
+			and b.plan_code = a.plan_code
+where
+	a.prior_ye_mbrs = 0
+	and b.jan_mbrs > 1;
+
+-- ADDS TERMS DEFAULT % AT REGION LEVEL 
+
+drop table if exists #default_addsterms_rgn; 
+
+with 
+add_term_step1 as (
+select
+a.pcp_region
+, right(a.yearmonth, 2) as Month
+, sum(a.adds) as adds
+, sum(a.conv_in) as conv_in
+, sum(a.terms) as terms
+, sum(a.conv_out) as conv_out
+, sum(a.total_net) as total_net
+, sum(a.total_membership) as total_membership
+, sum(a.plan_adds_conv_in) as plan_adds_conv_in
+, sum(a.plan_terms_conv_out) as plan_terms_conv_out
+from #assumptions_base_addsterms a
+	inner join #plan_over_50 b on
+		b.pcp_region = a.pcp_region
+		and b.pcp_market = a.pcp_market
+		and b.pcp_type = a.pcp_type
+		and b.plan_code = a.plan_code
+	left join #new_plans d on  
+		d.pcp_region = a.pcp_region
+		and d.pcp_market = a.pcp_market
+		and d.pcp_type = a.pcp_type
+		and d.plan_code = a.plan_code
+where d.pcp_region is null 
+--and b.pcp_region is not null
+group by
+a.pcp_region
+, right(a.yearmonth, 2)
+)
+, add_term_step2 as (
+select
+a.pcp_region
+, a.Month
+, cast(coalesce((cast(a.adds as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4)) as [adds/mbr]				
+, cast(coalesce((cast(a.conv_in as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [conv_in/mbr]		
+, cast(coalesce((cast(a.terms as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [terms/mbr]         
+, cast(coalesce((cast(a.conv_out as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [conv_out/mbr]    
+, cast(coalesce((cast(a.plan_adds_conv_in as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [plan_conv_in/mbr] -- added
+, cast(coalesce((cast(a.plan_terms_conv_out as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [plan_conv_out/mbr] -- added
+from add_term_step1 a
+)
+, add_term_step3 as (
+select
+a.pcp_region
+, a.Month
+, case -- added case statements to retain as much real as possible and replace with ent defaults where out of thresholds
+	when a.[adds/mbr] < b.Adds_Min then b.Adds_Min 
+	when a.[adds/mbr] > b.Adds_Max then b.Adds_Max else a.[adds/mbr] end as [adds/mbr]
+, case 
+	when a.[conv_in/mbr] < b.Conv_in_Min then b.Conv_in_Min
+	when a.[conv_in/mbr] > b.Conv_in_Max then b.Conv_in_Max else a.[conv_in/mbr] end as [conv_in/mbr]
+, case 
+	when a.[terms/mbr] < b.Terms_Min then b.Terms_Min
+	when a.[terms/mbr] > b.Terms_Max then b.Terms_Max else a.[terms/mbr] end as [terms/mbr]
+, case 
+	when a.[conv_out/mbr] < b.Conv_out_Min then b.Conv_out_Min
+	when a.[conv_out/mbr] > b.Conv_out_Max then b.Conv_out_Max else a.[conv_out/mbr] end as [conv_out/mbr]
+, case when a.[plan_conv_in/mbr] > c.plan_conv_in_Max then c.plan_conv_in_Max else a.[plan_conv_in/mbr] end as [plan_conv_in/mbr]
+, case when a.[plan_conv_out/mbr] > c.plan_conv_out_Max then c.plan_conv_out_Max else a.[plan_conv_out/mbr] end as [plan_conv_out/mbr]
+from add_term_step2 a
+	left join #add_terms_thresholds b on
+		b.Month = a.month
+	left join #plan_conv_thresholds c on
+		c.Month = a.month
+)
+select
+pcp_region
+, Month
+, [adds/mbr]
+, [conv_in/mbr]
+, [terms/mbr]
+, [conv_out/mbr]
+, [plan_conv_in/mbr]
+, [plan_conv_out/mbr]
+into #default_addsterms_rgn  
+from add_term_step3;
+
+-- ADDS TERMS DEFAULT % AT MARKET AND PCP TYPE AND PLAN TYPE LEVEL
+drop table if exists #default_addsterms_mkt; 
+
+with 
+add_term_step1 as (
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, right(a.yearmonth, 2) as Month
+, sum(a.adds) as adds
+, sum(a.conv_in) as conv_in
+, sum(a.terms) as terms
+, sum(a.conv_out) as conv_out
+, sum(a.total_net) as total_net
+, sum(a.total_membership) as total_membership
+, sum(a.plan_adds_conv_in) as plan_adds_conv_in
+, sum(a.plan_terms_conv_out) as plan_terms_conv_out
+from #assumptions_base_addsterms a
+	inner join #plan_over_50 b on
+		b.pcp_region = a.pcp_region
+		and b.pcp_market = a.pcp_market
+		and b.pcp_type = a.pcp_type
+		and b.plan_code = a.plan_code
+	left join #new_plans d on  
+		d.pcp_region = a.pcp_region
+		and d.pcp_market = a.pcp_market
+		and d.pcp_type = a.pcp_type
+		and d.plan_code = a.plan_code
+where d.pcp_region is null 
+and b.pcp_region is not null
+group by
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, right(a.yearmonth, 2)
+)
+, add_term_step2 as (
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, a.Month
+, cast(coalesce((cast(a.adds as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4)) as [adds/mbr]				--- keep with backing out net
+, cast(coalesce((cast(a.conv_in as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [conv_in/mbr]		--- keep with backing out net
+, cast(coalesce((cast(a.terms as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [terms/mbr]          --- keep with backing out net
+, cast(coalesce((cast(a.conv_out as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [conv_out/mbr]    --- keep with backing out net
+, cast(coalesce((cast(a.plan_adds_conv_in as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [plan_conv_in/mbr] -- added
+, cast(coalesce((cast(a.plan_terms_conv_out as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [plan_conv_out/mbr] -- added
+from add_term_step1 a
+)
+, add_term_step3 as (
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, a.Month
+, case 
+	when a.[adds/mbr] < b.Adds_Min then b.Adds_Min 
+	when a.[adds/mbr] > b.Adds_Max then b.Adds_Max else a.[adds/mbr] end as [adds/mbr]
+, case 
+	when a.[conv_in/mbr] < b.Conv_in_Min then b.Conv_in_Min
+	when a.[conv_in/mbr] > b.Conv_in_Max then b.Conv_in_Max else a.[conv_in/mbr] end as [conv_in/mbr]
+, case 
+	when a.[terms/mbr] < b.Terms_Min then b.Terms_Min
+	when a.[terms/mbr] > b.Terms_Max then b.Terms_Max else a.[terms/mbr] end as [terms/mbr]
+, case 
+	when a.[conv_out/mbr] < b.Conv_out_Min then b.Conv_out_Min
+	when a.[conv_out/mbr] > b.Conv_out_Max then b.Conv_out_Max else a.[conv_out/mbr] end as [conv_out/mbr]
+, case when a.[plan_conv_in/mbr] > c.plan_conv_in_Max then c.plan_conv_in_Max else a.[plan_conv_in/mbr] end as [plan_conv_in/mbr]
+, case when a.[plan_conv_out/mbr] > c.plan_conv_out_Max then c.plan_conv_out_Max else a.[plan_conv_out/mbr] end as [plan_conv_out/mbr]
+from add_term_step2 a
+	left join #add_terms_thresholds b on
+		b.Month = a.month
+	left join #plan_conv_thresholds c on
+		c.Month = a.month
+)
+select
+pcp_region
+, pcp_market
+, pcp_type
+, plan_type
+, Month
+, [adds/mbr]
+, [conv_in/mbr]
+, [terms/mbr]
+, [conv_out/mbr]
+, [plan_conv_in/mbr]
+, [plan_conv_out/mbr]
+into #default_addsterms_mkt   --select * from #default_addsterms_mkt order by 1,2,3,4
+from add_term_step3;
+
+-- ADDS TERMS DEFAULT % AT PLAN LEVEL
+drop table if exists #default_addsterms_plan;
+
+with 
+add_term_step1 as (  -- aggregate data
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, a.plan_code
+, right(a.yearmonth, 2) as Month
+, sum(a.adds) as adds
+, sum(a.conv_in) as conv_in
+, sum(a.terms) as terms
+, sum(a.conv_out) as conv_out
+, sum(a.total_net) as total_net
+, sum(a.total_membership) as total_membership
+, sum(a.plan_adds_conv_in) as plan_adds_conv_in
+, sum(a.plan_terms_conv_out) as plan_terms_conv_out
+from #assumptions_base_addsterms a
+group by
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, a.plan_code
+, right(a.yearmonth, 2)
+)
+, add_term_step2 as (  -- calculate %s using aggregate data and add flags for new and < 50 plans
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, a.plan_code
+, a.Month
+, a.total_membership
+, cast(coalesce((cast(a.adds as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4)) as [adds/mbr]				--- keep with backing out net?
+, cast(coalesce((cast(a.conv_in as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [conv_in/mbr]		--- keep with backing out net?
+, cast(coalesce((cast(a.terms as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [terms/mbr]          --- keep with backing out net?
+, cast(coalesce((cast(a.conv_out as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [conv_out/mbr]    --- keep with backing out net?
+, cast(coalesce((cast(a.plan_adds_conv_in as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [plan_conv_in/mbr] -- added
+, cast(coalesce((cast(a.plan_terms_conv_out as decimal)/nullif(a.total_membership - a.total_net,0)),0) as decimal(19,4))  as [plan_conv_out/mbr] -- added
+, case when b.plan_code is null then 1 else 0 end as plan_under_50
+, case when d.plan_code is not null then 1 else 0 end as new_plan
+from add_term_step1 a
+	left join #plan_over_50 b on
+		b.pcp_region = a.pcp_region
+		and b.pcp_market = a.pcp_market
+		and b.pcp_type = a.pcp_type
+		and b.plan_code = a.plan_code
+	left join #new_plans d on
+		d.pcp_region = a.pcp_region
+		and d.pcp_market = a.pcp_market
+		and d.pcp_type = a.pcp_type
+		and d.plan_code = a.plan_code
+)
+,add_term_step3 as (  -- create table with default and error handling logic 
+select
+a.pcp_region
+, a.pcp_market
+, a.pcp_type
+, a.plan_type
+, a.plan_code
+, a.Month
+, a.total_membership
+, case 
+	when a.[adds/mbr] < 0 then 0
+	when a.[adds/mbr] is null then isnull(c.[adds/mbr],d.[adds/mbr])
+	when a.new_plan = '1'  or a.plan_under_50 = '1' then isnull(c.[adds/mbr],d.[adds/mbr])
+	when a.[adds/mbr] > c.[adds/mbr] then c.[adds/mbr] else a.[adds/mbr] end as [adds/mbr]
+, case 
+	when a.[conv_in/mbr] < 0 then 0
+	when a.[conv_in/mbr] is null then isnull(c.[conv_in/mbr], d.[conv_in/mbr])
+	when a.new_plan = '1'  or a.plan_under_50 = '1' then isnull(c.[conv_in/mbr],d.[conv_in/mbr])
+	when a.[conv_in/mbr] > c.[conv_in/mbr] then c.[conv_in/mbr] else a.[conv_in/mbr] end as [conv_in/mbr]
+, case 
+	when a.[terms/mbr] < 0 then 0
+	when a.[terms/mbr] is null then isnull(c.[terms/mbr], d.[terms/mbr])
+	when a.new_plan = '1'  or a.plan_under_50 = '1' then isnull(c.[terms/mbr], d.[terms/mbr])
+	when a.[terms/mbr] > c.[terms/mbr] then c.[terms/mbr] else a.[terms/mbr] end as [terms/mbr]
+, case 
+	when a.[conv_out/mbr] < 0 then 0
+	when a.[conv_out/mbr] is null then isnull(c.[conv_out/mbr], d.[conv_out/mbr])
+	when a.new_plan = '1'  or a.plan_under_50 = '1' then isnull(c.[conv_out/mbr], d.[conv_out/mbr])
+	when a.[conv_out/mbr] > c.[conv_out/mbr] then c.[conv_out/mbr] else a.[conv_out/mbr] end as [conv_out/mbr]
+, case
+	when a.new_plan = '1'  or a.plan_under_50 = '1' then isnull(c.[plan_conv_in/mbr], d.[plan_conv_in/mbr])
+	when a.[plan_conv_in/mbr] > c.[plan_conv_in/mbr] then c.[plan_conv_in/mbr]
+	when a.[plan_conv_in/mbr] is null then isnull(c.[plan_conv_in/mbr], d.[plan_conv_in/mbr]) else a.[plan_conv_in/mbr] end as [plan_conv_in/mbr]
+, case 
+	when a.new_plan = '1'  or a.plan_under_50 = '1' then isnull(c.[plan_conv_out/mbr], d.[plan_conv_out/mbr])
+	when a.[plan_conv_out/mbr] > c.[plan_conv_out/mbr] then c.[plan_conv_out/mbr]
+	when a.[plan_conv_out/mbr] is null then isnull(c.[plan_conv_out/mbr], d.[plan_conv_out/mbr]) else a.[plan_conv_out/mbr] end as [plan_conv_out/mbr]
+, plan_under_50
+, new_plan
+, case when a.[adds/mbr] < b.Adds_Min or a.[adds/mbr] > b.Adds_Max then 1 else 0 end as adds_flag
+, case when a.[conv_in/mbr] < b.Conv_in_Min or a.[conv_in/mbr] > b.Conv_in_Max then 1 else 0 end as conv_in_flag
+, case when a.[terms/mbr] < b.Terms_Min or a.[terms/mbr] > b.Terms_Max then 1 else 0 end as term_flag
+, case when a.[conv_out/mbr] < b.Conv_out_Min or a.[conv_out/mbr] > b.Conv_out_Max then 1 else 0 end as conv_out_flag
+from add_term_step2 a
+	left join #add_terms_thresholds b on
+		b.Month = a.month
+	left join #default_addsterms_mkt c on
+		c.pcp_market = a.pcp_market
+		and c.pcp_type = a.pcp_type
+		and c.plan_type = a.plan_type
+		and c.Month = a.Month
+	left join #default_addsterms_rgn d on -- select * from #default_addsterms_rgn_mkt where pcp_market = 'NFL' order by 1,2,3 
+		d.pcp_region = a.pcp_region
+		and d.Month = a.Month
+)
+select
+pcp_region
+, pcp_market
+, pcp_type
+, plan_code
+, Month
+, total_membership
+, [adds/mbr]
+, [conv_in/mbr]
+, [terms/mbr]
+, [conv_out/mbr]
+, [plan_conv_in/mbr]
+, [plan_conv_out/mbr]
+into #default_addsterms_plan  
+from add_term_step3;
+
+-- support copies for records
+SELECT * FROM #default_addsterms_plan;
+SELECT * FROM #default_addsterms_mkt;
+SELECT * FROM #default_addsterms_rgn;
+
+GO
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/*	SECTION 2: FORECASTING 5YR CALCULATED	*/ 
+
+DROP TABLE IF EXISTS #outputFINALbase;
+DROP TABLE IF EXISTS #Adj2;
+DROP TABLE IF EXISTS #output2;
+DROP TABLE IF EXISTS #outputBASEcsv;
+DROP TABLE IF EXISTS #MFS_ENT_F2;
+DROP TABLE IF EXISTS #outputMEMbase;
+DROP TABLE IF EXISTS #outputGrowthpct;
+DROP TABLE IF EXISTS #outputFctADD_TERM;
+DROP TABLE IF EXISTS #outputFctCONV_OUTprep; 
+DROP TABLE IF EXISTS #outputASMPT; 
+DROP TABLE IF EXISTS #outputFctMEM;
+
+
+select Payor as payor
+,insco
+,plan_group
+,Plan_Type as plan_type
+,plan_code
+,yearmonth
+,pcp_region
+,pcp_market
+,pcp_pool_hce
+,pcp_pool
+,pcp_type
+,location
+,practice
+,department
+,segment
+,business_unit
+,project_id
+,'0000000' as Updated_Customer_Code
+,customer
+,product
+,account
+,Total_adds
+,null as plan_adds_conv_in
+,0 as adds
+,0 as conv_in
+,Total_terms
+,null as plan_terms_conv_out
+,0 as terms
+,0 as conv_out
+,total_net
+,total_membership
+,adj_membership
+,'Data_Adj.csv' as [Table Names]
+,0 as adds_cohort
+,0 as conv_cohort
+,0 as retained_cohort
+,0 as terms_cohort
+,0 as adds_cohort_2
+,0 as conv_cohort_2
+,0 as retained_cohort_2
+,0 as terms_cohort_2
+,0 as record_type_adds
+,0 as record_type_conv
+,0 as record_type_retained
+,0 as record_type_terms
+into
+#Adj2
+from #Adj;
+
+select Payor as payor
+,insco
+,plan_group
+,Plan_Type as plan_type
+,plan_code
+,yearmonth
+,pcp_region
+,pcp_market
+,pcp_pool_hce
+,pcp_pool 
+,pcp_type
+,location
+,practice
+,department
+,segment
+,business_unit
+,project_id
+,'0000000' as Updated_Customer_Code 
+,customer
+,product
+,account
+,Total_adds
+,plan_adds_conv_in --new
+,adds
+,conv_in
+,Total_terms
+,plan_terms_conv_out --- new
+,terms
+,conv_out
+,total_net
+,total_membership
+,0 as adj_membership
+,'Data_ENT.csv' as [Table Names]
+,adds_cohort ---- cohort
+,conv_cohort ---- cohort
+,retained_cohort ---- cohort
+,terms_cohort ---- cohort
+,adds_cohort_2
+,conv_cohort_2
+,retained_cohort_2
+,terms_cohort_2
+,record_type_adds
+,record_type_conv
+,record_type_retained
+,record_type_terms
+into
+#output2
+from #output;
+drop table if exists #output;
+
+-----Base Table before forecasting data is added
+select *
+into #outputBASEcsv
+from
+#Adj2
+union all
+select *
+from
+#output2
+drop table if exists #output2;
+
+select *
+into #MFS_ENT_F2
+from
+#MFS_ENT d;
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/*------------ OEP SEP AND ADDS, TERMS, CONVERSIONS JOINS @ DIFFERENT LEVELES OF DETAIL PLAN > MARKET > REGION ----------------*/
+
+drop table if exists #outputMEMbase;
+select a.*
+,e.month
+,e.[adds/mbr] as adds_mbrB			
+,e.[conv_in/mbr] as conv_in_mbrB	
+,e.[terms/mbr] as terms_mbrB		
+,e.[conv_out/mbr] as conv_out_mbrB	
+,f.[adds/mbr] as adds_mbrC			
+,f.[conv_in/mbr] as conv_in_mbrC	
+,f.[terms/mbr] as terms_mbrC		
+,f.[conv_out/mbr] as conv_out_mbrC	
+,e.[plan_conv_in/mbr] as plan_conv_in_pd	-- @ Plan level
+,e.[plan_conv_out/mbr] as plan_conv_out_pd	-- @ Plan level
+,f.[plan_conv_in/mbr] as plan_conv_in_md	-- @ Mkt level
+,f.[plan_conv_out/mbr] as plan_conv_out_md	-- @ Mkt level
+,g.[adds/mbr] as adds_mbrD					-- @ Rgn level
+,g.[conv_in/mbr] as conv_in_mbrD			-- @ Rgn level
+,g.[terms/mbr] as terms_mbrD				-- @ Rgn level
+,g.[conv_out/mbr] as conv_out_mbrD			-- @ Rgn level
+,g.[plan_conv_in/mbr] as plan_conv_in_rd	-- @ Rgn level
+,g.[plan_conv_out/mbr] as plan_conv_out_rd	-- @ Rgn level
+,d.lookup_year
+,d.lookup
+,d.year
+,d.[OEP Growth %] 	
+,d.[SEP Growth %]	
+,isnull(isnull(b.OEP_Growth_Final, c.OEP_Growth_Final), 0.03) as [OEP Growth Default]  
+,isnull(isnull(b.SEP_Growth_Final, c.SEP_Growth_Final), 0.02) as [SEP Growth Default]
+,CONCAT(a.plan_code,a.pcp_region, a.pcp_market, a.pcp_pool, a.pcp_type) AS [Lookup_ID]
+,CONCAT(a.plan_code, a.pcp_region, a.pcp_market, a.pcp_pool, a.pcp_type, a.yearmonth) AS [Lookup_ID_yrmonth]
+,cast(right(a.[Yearmonth],2) as int) as Bmonth
+,CAST(SUBSTRING(a.yearmonth, 1, 4) AS INT) as Byear
+into #outputMEMbase 
+from  
+#outputBASEcsv a
+	left join #plan_OEP_SEP_Defaults b   --select * from #plan_OEP_SEP_Defaults
+		on a.pcp_market = b.pcp_market and a.plan_code = b.plan_code and a.pcp_type = b.pcp_type and a.pcp_region = b.pcp_region
+	left join #mkt_OEP_SEP_Defaults c	--select * from #mkt_OEP_SEP_Defaults
+		on a.pcp_market = c.pcp_market and  a.pcp_type = c.pcp_type and a.pcp_region = c.pcp_region
+	left join #MFS_ENT_F2 d
+		on a.plan_code = d.plan_code and a.pcp_type = d.pcp_type and CAST(SUBSTRING(a.yearmonth, 1, 4) AS INT) = cast(d.year as int) and a.pcp_region = d.pcp_region and a.pcp_market = d.pcp_market
+	left join #default_addsterms_plan e	-- select * from #default_addsterms_plan
+		on a.plan_code = e.plan_code and a.pcp_type = e.pcp_type and a.pcp_region = e.pcp_region and a.pcp_market = e.pcp_market and right(a.yearmonth, 2) = e.Month
+	left join #default_addsterms_mkt f -- select * from #default_addsterms_mkt order by 1,2,3,4,5
+		on a.pcp_type = f.pcp_type and a.plan_type = f.plan_type and a.pcp_region = f.pcp_region and a.pcp_market = f.pcp_market and right(a.yearmonth, 2) = f.Month
+	left join #default_addsterms_rgn g
+		on a.pcp_region = g.pcp_region and right(a.yearmonth, 2) = g.Month
+drop table if exists #outputBASEcsv;
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- set final % to use for calcs
+drop table if exists #outputASMPT;
+select a.*
+	, ROUND(ISNULL(CAST(a.[OEP Growth %] AS REAL), CAST(a.[OEP Growth Default] AS REAL)), 3) AS [OEP]
+    , ROUND(ISNULL(CAST(a.[SEP Growth %] AS REAL), CAST(a.[SEP Growth Default] AS REAL)), 3) AS [SEP]
+	, ROUND(COALESCE(CAST(adds_mbrB AS REAL),CAST(adds_mbrC AS REAL),CAST(adds_mbrD AS REAL)),3) AS [Adds/Mbr Assumption]
+	, ROUND(COALESCE(CAST(terms_mbrB AS REAL),CAST(terms_mbrC AS REAL),CAST(terms_mbrD AS REAL)),3) AS [Terms/Mbr Assumption]
+	, ROUND(COALESCE(CAST(conv_in_mbrB AS REAL),CAST(conv_in_mbrC AS REAL),CAST(conv_in_mbrD AS REAL)),3) AS [ConvIn/Mbr Assumption]
+	, ROUND(COALESCE(CAST(conv_out_mbrB AS REAL),CAST(conv_out_mbrC AS REAL),CAST(conv_out_mbrD AS REAL)),3) AS [CONV_OUT_TEST]	
+	, ROUND(COALESCE(CAST(plan_conv_in_pd AS REAL),CAST(plan_conv_in_md AS REAL),CAST(plan_conv_in_rd AS REAL)),3) AS [plan_convIn/Mbr]
+	, ROUND(COALESCE(CAST(plan_conv_out_pd AS REAL),CAST(plan_conv_out_md AS REAL),CAST(plan_conv_out_rd AS REAL)),3) AS [plan_convOut/Mbr]
+into #outputASMPT
+from #outputMEMbase a  
+
+drop table if exists #outputMEMbase;
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--Set up for membership calcs to use in loops to get final number 
+drop table if exists #outputASMPT2;
+
+--Current year setup (G2G)
+with currentYrCalc as (
+select *
+, ISNULL(((total_membership * SEP)/(12 - CAST(RIGHT((select * from #ActualsCutoff), 2) AS FLOAT))),0) as mnthly_member
+from #outputASMPT
+where yearmonth = (select * from #ActualsCutoff)
+)
+select x.*
+, a.mnthly_member
+into #outputASMPT2
+from #outputASMPT x
+	left join currentYrCalc a
+		on a.plan_code = x.plan_code
+		and left(a.yearmonth, 4) = left(x.yearmonth, 4)
+		and a.pcp_region = x.pcp_region
+		and a.pcp_market = x.pcp_market
+		and a.pcp_pool = x.pcp_pool
+		and a.pcp_type = x.pcp_type
+order by
+x.pcp_market, x.pcp_pool, x.plan_code, x.yearmonth;
+
+drop table if exists #outputASMPT;
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/* FORECAST MEMBERSHIP SECTION 1 : ESTABLISH GROUPERS AND INDEXING, FORECAST +1 MONTH, AND LOOP THROUGH REMAINING CURRENT YEAR */
+BEGIN
+
+DROP TABLE IF EXISTS #step_one, #temp1, #actuals_plusone, #grouper, #gpr;
+
+-- Prepare small data set for testing
+DECLARE @jumpoff INT = (select * from #ActualsCutoff);
+
+SELECT *,
+    NULL AS grouper_id,
+    NULL AS grouper_seq
+INTO #temp1
+FROM #outputASMPT2
+ORDER BY [Byear], [Bmonth];
+
+drop table if exists #outputASMPT2;
+
+--Create grouper indexes
+WITH grouper AS (
+    SELECT DISTINCT
+        plan_code,
+        pcp_market,
+        pcp_pool,
+        pcp_type
+    FROM #temp1
+)
+SELECT * INTO #grouper FROM grouper;
+
+WITH gpr AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY (SELECT 0)) AS grouper_id
+    FROM #grouper
+)
+SELECT * INTO #gpr FROM gpr;
+
+-- Create indexes on #grouper and #gpr
+CREATE INDEX idx_grouper ON #grouper (plan_code, pcp_market, pcp_pool, pcp_type);
+CREATE INDEX idx_gpr ON #gpr (grouper_id);
+
+-- Update #temp1 with grouper_id and grouper_seq
+WITH x AS (
+    SELECT
+        x.Lookup_ID_yrmonth,
+        g.grouper_id,
+        ROW_NUMBER() OVER (PARTITION BY g.grouper_id ORDER BY yearmonth ASC) AS grouper_seq
+    FROM #temp1 x
+    INNER JOIN #gpr g 
+        ON g.plan_code = x.plan_code
+        AND g.pcp_market = x.pcp_market
+        AND g.pcp_pool = x.pcp_pool
+        AND g.pcp_type = x.pcp_type
+)
+UPDATE t
+SET t.grouper_id = x.grouper_id,
+    t.grouper_seq = x.grouper_seq
+FROM #temp1 t
+INNER JOIN x 
+    ON x.Lookup_ID_yrmonth = t.Lookup_ID_yrmonth;
+
+-- Create indexes on #temp1
+CREATE INDEX idx_temp1 ON #temp1 (grouper_id, grouper_seq);
+
+-- Create clustered index on #temp1
+CREATE CLUSTERED INDEX Indx1 ON #temp1 (grouper_seq, grouper_id);
+
+-- Add forecast membership column
+ALTER TABLE #temp1
+ADD [fcst_membership] DECIMAL(18, 6) DEFAULT (0.0);
+
+-- Create #actuals_plusone table
+SELECT
+    x.Lookup_ID_yrmonth,
+    x.[Bmonth],
+    x.grouper_seq,
+    x.grouper_id,
+	x.mnthly_member,
+    CASE 
+        WHEN x.yearmonth <= (select * from #ActualsCutoff) THEN CAST(x.total_membership AS FLOAT)
+        WHEN CAST(x.yearmonth AS INT) = (CAST((select * from #ActualsCutoff) AS INT) + 1) THEN (
+		ISNULL(LAG(CAST(x.total_membership AS FLOAT), 1, 0) OVER (PARTITION BY x.grouper_id ORDER BY x.grouper_id, x.grouper_seq),0) + x.mnthly_member
+        )
+        ELSE null
+    END AS mbr
+INTO #actuals_plusone      
+FROM #temp1 x;       
+
+-- Update forecast membership in #temp1
+UPDATE x
+SET x.fcst_membership = y.mbr
+FROM #temp1 x
+INNER JOIN #actuals_plusone y
+    ON y.grouper_seq = x.grouper_seq AND y.grouper_id = x.grouper_id;
+
+-- Drop #actuals_plusone table
+DROP TABLE IF EXISTS #actuals_plusone;
+
+-- update forecast membership in #temp1 with adjusted starting membership typically future year jan    
+update x
+set x.fcst_membership = y.adj_membership
+from #temp1 x
+	inner join #Adj2 y on
+		y.plan_code = x.plan_code and y.pcp_market = x.pcp_market and y.pcp_pool = x.pcp_pool and y.pcp_type = x.pcp_type and y.yearmonth = (cast(x.Byear as varchar) + right('0' + cast(x.Bmonth as varchar), 2));
+
+drop table #Adj2;
+
+END;
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--//  DUPLICATION CHECK PRE LOOPING  //--
+
+select 'Dupe Check';
+with cte_dup as (
+select 
+*
+, row_number() OVER(partition by lookup_id_yrmonth order by lookup_id_yrmonth) as dupe
+from #temp1
+),
+cte_dup2 as (
+select 
+distinct lookup_id_yrmonth
+, count(lookup_id_yrmonth) as count 
+from cte_dup 
+/*where dupe <> 1*/
+group by lookup_id_yrmonth 
+--order by count(lookup_id_yrmonth) desc
+)
+select 
+x.* 
+--distinct Payor, Insco, Plan_group, plan_type, plan_code
+from #temp1 x
+ left join cte_dup2 c on c.lookup_id_yrmonth = x.lookup_id_yrmonth
+where count > 1
+order BY x.Lookup_ID_yrmonth --1,2,5,4,3; 
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/* FORECAST MEMBERSHIP SECTION 2 : REC CTE 1 FORECAST CURRENT YEAR; LOOPED REC CTE 2 FORECAST OUTER YEARS (+5) */
+
+-- select * into #temp1backup from #temp1; --  |	drop table #temp1	|	select * into #temp1 from #temp1backup	select count(*) from #temp1
+	
+-- Final Indexing for optimization  
+CREATE NONCLUSTERED INDEX idx_temp1_forecast ON #temp1 (grouper_id, grouper_seq);
+go
+
+ALTER TABLE #temp1 ADD yearmonth_date DATE;
+go
+
+UPDATE #temp1
+SET yearmonth_date = DATEFROMPARTS(LEFT(yearmonth, 4), RIGHT(yearmonth, 2), 1);
+
+DECLARE @ActualsCutoff VARCHAR(6) = (SELECT TOP 1 ActualsCutoff FROM #ActualsCutoff);
+DECLARE @cutoffYear VARCHAR(4) = LEFT(@ActualsCutoff, 4);
+DECLARE @cutoffMonth VARCHAR(2) = RIGHT('0' + @ActualsCutoff, 2);
+
+-- Recursive CTE to calculate forecast_membership
+WITH ForecastCTE AS (
+    SELECT 
+        grouper_id,
+        yearmonth,
+		yearmonth_date,
+        total_membership AS forecast_membership
+    FROM #temp1
+    WHERE yearmonth = @ActualsCutoff
+
+    UNION ALL
+
+    SELECT 
+        t.grouper_id,
+        t.yearmonth,
+		t.yearmonth_date,
+        case 
+			when right(t.yearmonth, 2) = '01' and r.forecast_membership is not null
+				then CAST(r.forecast_membership * (1 + t.oep) AS FLOAT) 
+			when right(t.yearmonth, 2) > '01' and left(t.yearmonth, 4) = @cutoffYear and r.forecast_membership is not null
+				then CAST(r.forecast_membership + t.mnthly_member AS FLOAT)
+			end AS forecast_membership
+    FROM #temp1 t
+    INNER JOIN ForecastCTE r
+        ON t.grouper_id = r.grouper_id
+		AND t.yearmonth_date = DATEADD(MONTH, 1, r.yearmonth_date)
+    WHERE t.yearmonth between @ActualsCutoff and (cast(@cutoffYear + 1 as varchar) + '01')
+)
+
+UPDATE t
+SET t.fcst_membership =  f.forecast_membership
+FROM #temp1 t
+INNER JOIN ForecastCTE f
+    ON t.grouper_id = f.grouper_id AND t.yearmonth = f.yearmonth;
+GO  
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--//  Pool Adj Jan FY  //--
+
+UPDATE x 
+SET x.fcst_membership = y.adj_membership
+--SELECT *
+FROM #temp1 x
+	INNER JOIN #Pool_Adj y ON 
+		y.plan_code = x.plan_code
+		AND y.yearmonth = x.yearmonth AND y.pcp_market = x.pcp_market AND y.pcp_pool_hce = x.pcp_pool_hce
+		AND y.pcp_pool = x.pcp_pool AND y.pcp_type = x.pcp_type
+WHERE x.yearmonth = '202601'
+;
+GO
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--//  Add Flag Column for Remove for Reporting  //--
+BEGIN
+ALTER TABLE #temp1
+ADD reporting_exclude_flag VARCHAR(6);
+END
+GO
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+--//  Forecast future years  //--
+
+-- Begin Loop
+DECLARE @ActualsCutoff VARCHAR(6) = (SELECT TOP 1 ActualsCutoff FROM #ActualsCutoff);
+DECLARE @cutoffYear VARCHAR(4) = LEFT(@ActualsCutoff, 4);
+DECLARE @cutoffMonth VARCHAR(2) = RIGHT('0' + @ActualsCutoff, 2);
+DECLARE @lastloop_n INT = 0;
+DECLARE @loop_n INT = 1;
+
+
+WHILE @loop_n <= 5   --- setting this for 5 yr forecast i.e. loop through 5 times
+
+BEGIN
+
+--calc next year monthly growth
+with currentYrCalc as (
+			select *
+			, case when @loop_n >= 2 and SEP < .01 then ISNULL(((fcst_membership * 0.015)/cast(11 as float)),0) else ISNULL(((fcst_membership * SEP)/cast(11 as float)),0) end as mnthly_member2  
+			from #temp1 y
+			where yearmonth = (cast(@cutoffYear + @loop_n as varchar) + '01')     
+								)
+		UPDATE #temp1
+		SET mnthly_member =  a.mnthly_member2
+		from currentYrCalc a 
+			INNER JOIN #temp1 x
+				on a.plan_code = x.plan_code
+				and left(a.yearmonth, 4) = left(x.yearmonth, 4)
+				and a.pcp_region = x.pcp_region
+				and a.pcp_market = x.pcp_market
+				and a.pcp_pool = x.pcp_pool
+				and a.pcp_type = x.pcp_type;
+
+-- Recursive CTE to calculate [TESTING] for next year
+WITH ForecastCTE AS (
+    SELECT 
+        grouper_id,
+        yearmonth,
+		yearmonth_date,
+		cast(fcst_membership as float) as forecast_membership
+    FROM #temp1
+    WHERE yearmonth = (cast(@cutoffYear + @loop_n as varchar) + '01')
+
+    UNION ALL
+
+    SELECT 
+        t.grouper_id,
+        t.yearmonth,
+		t.yearmonth_date,
+        case 
+			when right(t.yearmonth, 2) > '01' and left(t.yearmonth, 4) = (cast(@cutoffYear + @loop_n as varchar)) and r.forecast_membership is not null
+				then CAST(r.forecast_membership + t.mnthly_member AS FLOAT)
+			when right(t.yearmonth, 2) = '01' and left(t.yearmonth, 4) = (cast(@cutoffYear + @loop_n + 1 as varchar)) and r.forecast_membership is not null
+				then CAST(r.forecast_membership * (1 + t.oep) AS FLOAT) 
+			end AS forecast_membership
+    FROM #temp1 t
+    INNER JOIN ForecastCTE r
+        ON t.grouper_id = r.grouper_id
+		AND t.yearmonth_date = DATEADD(MONTH, 1, r.yearmonth_date)
+    WHERE t.yearmonth between (cast(@cutoffYear + @loop_n as varchar) + '02') and (cast(@cutoffYear + @loop_n + 1 as varchar) + '01')
+)
+
+UPDATE t
+SET t.fcst_membership =  f.forecast_membership
+FROM #temp1 t
+INNER JOIN ForecastCTE f
+    ON t.grouper_id = f.grouper_id AND t.yearmonth = f.yearmonth;
+
+SET @lastloop_n = @loop_n;
+SET @loop_n = @lastloop_n + 1;
+
+END;
+go
+
+---------------------------------------------------------------------------------------------------------------------------------
+/*------------------------ Seasonality to Fcst_Memberhsip --------------------------*/
+--  NOTE: need to add this prior to all other calcs because alot work ofF this number 
+--  Formula below will be first finding month over month growth %s in 1st cte, then apply that percent to sep%
+--  Final Formula = fcst_Memberhsip * (1 + (month_over_month_diff [%] * SEP%))
+
+DROP TABLE IF EXISTS #SEP_Seasonality;
+
+SELECT
+pcp_market
+, plan_type
+, Bmonth
+, SUM(total_membership) AS monthly_sum
+, SUM(NULLIF(total_membership,0)) / LAG(SUM(NULLIF(total_membership,0))) OVER (
+	PARTITION BY pcp_market, plan_type 
+	ORDER BY Bmonth
+	) - 1 AS month_over_month_diff
+INTO #SEP_Seasonality
+FROM #temp1
+WHERE Byear = (SELECT * FROM #Year) - 1 AND Bmonth BETWEEN 1 AND 11 -- pull prior year
+GROUP BY
+pcp_market
+, plan_type
+, Bmonth;
+
+GO
+
+-- Apply monthly Seasonality (15 sec)
+UPDATE t 
+SET
+--SELECT t.*,
+t.fcst_membership = CASE WHEN t.yearmonth BETWEEN (SELECT * FROM #ActualsCutoff) + 1 AND CONCAT((SELECT * FROM #Year), '11')  THEN (CAST(t.fcst_membership AS FLOAT) * ( 1 + (ISNULL(s.month_over_month_diff,0) * t.SEP)))--(CAST(t.fcst_membership AS FLOAT) * ( 1 + ISNULL(c.s_factor,0)))
+					WHEN t.Byear > (SELECT * FROM #Year) AND t.Bmonth = '01' THEN t.fcst_membership
+					WHEN t.Byear > (SELECT * FROM #Year) AND t.Bmonth BETWEEN '02' AND '11' THEN (CAST(t.fcst_membership AS FLOAT) * ( 1 + (ISNULL(s.month_over_month_diff,0) * t.SEP))) --(t.fcst_membership * ( 1 + ISNULL(s.s_factor,0)))
+					ELSE t.fcst_membership END --AS seasoned_mbrs
+FROM #temp1 t
+	LEFT JOIN #SEP_Seasonality s ON 
+		s.pcp_market = t.pcp_market
+		AND s.plan_type = t.plan_type
+		AND s.Bmonth = t.Bmonth;
+
+GO
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+/*------------------------  ADDS TERMS CONV CALCS ----------------------------*/       
+BEGIN
+
+drop table if exists #outputFctMEM, #outputFctADD_TERM, #outputFctCONV_OUTprep, #outputFINALbase;
+
+select a.*
+,CAST(ROUND(fcst_membership, 0) AS INT) - lag(CAST(ROUND(fcst_membership, 0) AS INT),1,0) over(partition by grouper_id order by grouper_id,grouper_seq) as [Forecasted Net]                                                                       
+into #outputFctMEM 
+from
+#temp1 a
+order by grouper_id, grouper_seq
+drop table #temp1;
+
+select  a.*
+,case when [Yearmonth]<= cast((select * from #ActualsCutoff) as int) then [adds] else CAST(ROUND(cast([fcst_Membership] as float)*[Adds/Mbr Assumption],0) AS INT) end as [Forecasted Adds]
+,case when [Yearmonth]<= cast((select * from #ActualsCutoff) as int) then [terms] else CAST(ROUND(cast([fcst_Membership] as float)*[Terms/Mbr Assumption],0) AS INT) end as [Forecasted Terms]
+,case when [Yearmonth]<= cast((select * from #ActualsCutoff) as int) then [conv_in] else CAST(ROUND(cast([fcst_Membership] as float)*[ConvIn/Mbr Assumption],0) AS INT) end as [Forecasted Conv In Prep]
+,case when [Yearmonth]<= cast((select * from #ActualsCutoff) as int) then [plan_adds_conv_in] else CAST(ROUND(cast([fcst_Membership] as float)*[plan_convIn/Mbr],0) AS INT) end as [Forecasted Plan_Conv_In]
+,case when [Yearmonth]<= cast((select * from #ActualsCutoff) as int) then [plan_terms_conv_out] else CAST(ROUND(cast([fcst_Membership] as float)*[plan_convOut/Mbr],0) AS INT) end as [Forecasted Plan_Conv_Out]
+into #outputFctADD_TERM     --- drop table #outputFctADD_TERM  select * from #outputFctADD_TERM 
+from
+#outputFctMEM a
+drop table #outputFctMEM;
+
+select  a.*,
+case when [Yearmonth]<= (select * from #ActualsCutoff) then [conv_out] else [Forecasted Adds]+[Forecasted Conv In Prep]-[Forecasted Net]-[Forecasted Terms] end as [Forecasted Conv Out Prep]
+into #outputFctCONV_OUTprep     --- drop table #outputFctCONV_OUTprep   select * from #outputFctCONV_OUTprep 
+from
+#outputFctADD_TERM a
+drop table #outputFctADD_TERM;
+
+select  a.*,
+case when [Forecasted Conv Out Prep]<0 then [Forecasted Conv In Prep]-[Forecasted Conv Out Prep] else [Forecasted Conv In Prep] end as [Forecasted Conv In],
+case when [Forecasted Conv Out Prep]<0 then 0 else [Forecasted Conv Out Prep] end as [Forecasted Conv Out]
+into #outputFINALbase     --- drop table #outputFINALbase   select * from #outputFINALbase 
+from
+#outputFctCONV_OUTprep a
+order by grouper_id,grouper_seq
+drop table #outputFctCONV_OUTprep;
+
+END;
+
+------------------------------------------------------------------------------------------------------------------------------------
+/*--------------------- AdditionalCalcsColumns -------------------*/
+
+-- REDACTED --
+
+------------------------------------------------------------------------------------------------------------------------------------
+/*----------------------- FINAL CHECKS --------------------------*/
+
+-- REDACTED --
+
+------------------------------------------------------------------------------------------------------------------------------------
+/*		FINAL OUTPUT 5YR FORECAST OUTPUT	  */ 
+
+-- REDACTED -- 
+
+select * from #final_output
