@@ -68,7 +68,7 @@ pcw = pd.read_excel(r'R:/Accounting/HCE/Enterprise Reporting/Enterprise Data Sou
 
 #ADJ
 if adjustments == True :
-    adj = pd.read_excel(r'//sadcfs05.pmmr.com/Corporate/Wellmed/Accounting/HCE/BUDGET_FORECAST/{fp_year}/{fp_fcst}/Membership/Tableau_Reports/Copy of Adjustments_working_file.xlsx',
+    adj = pd.read_excel(r'R:/Corporate/Wellmed/Accounting/HCE/BUDGET_FORECAST/{fp_year}/{fp_fcst}/Membership/Tableau_Reports/Copy of Adjustments_working_file.xlsx',
                    sheet_name="Output",
                    index_col=None)
 else :
